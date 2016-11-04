@@ -408,23 +408,7 @@ class VMOps(object):
 
         memory_per_numa_node, cpus_per_numa_node = (
             self._get_instance_vnuma_config(instance, image_meta))
-
-        if memory_per_numa_node:
-            if CONF.hyperv.dynamic_memory_ratio > 1.0:
-                LOG.warning(_LW(
-                    "Instance vNUMA topology requested, but dynamic memory "
-                    "ratio is higher than 1.0 in nova.conf. Ignoring dynamic "
-                    "memory ratio option."), instance=instance)
-            dynamic_memory_ratio = 1.0
-            vnuma_enabled = True
-        else:
-            dynamic_memory_ratio = CONF.hyperv.dynamic_memory_ratio
-            vnuma_enabled = False
-
-        host_shutdown_action = (
-            os_win_const.HOST_SHUTDOWN_ACTION_SHUTDOWN
-            if CONF.hyperv.instance_automatic_shutdown
-            else None)
+        vnuma_enabled = bool(memory_per_numa_node)
 
         self._vmutils.create_vm(instance_name,
                                 vnuma_enabled,
@@ -432,31 +416,17 @@ class VMOps(object):
                                 instance_path,
                                 [instance.uuid])
 
-        self._vmutils.update_vm(instance_name,
-                                instance.memory_mb,
-                                memory_per_numa_node,
-                                instance.vcpus,
-                                cpus_per_numa_node,
-                                CONF.hyperv.limit_cpu_features,
-                                dynamic_memory_ratio,
-                                host_shutdown_action=host_shutdown_action)
-
-        flavor_extra_specs = instance.flavor.extra_specs
-        remote_fx_config = flavor_extra_specs.get(
-                constants.FLAVOR_REMOTE_FX_EXTRA_SPEC_KEY)
-        if remote_fx_config:
-            self._configure_remotefx(instance, vm_gen, remote_fx_config)
+        self.configure_remotefx(instance, vm_gen)
 
         self._vmutils.create_scsi_controller(instance_name)
 
         self._attach_root_device(instance_name, root_device)
-        self._attach_ephemerals(instance_name, block_device_info['ephemerals'])
+        self.attach_ephemerals(instance_name, block_device_info['ephemerals'])
         self._volumeops.attach_volumes(
             block_device_info['block_device_mapping'], instance_name)
 
         serial_ports = self._get_image_serial_port_settings(image_meta)
         self._create_vm_com_port_pipes(instance, serial_ports)
-        self._set_instance_disk_qos_specs(instance)
 
         for vif in network_info:
             LOG.debug('Creating nic for instance', instance=instance)
@@ -476,6 +446,50 @@ class VMOps(object):
             self._vmutils.enable_secure_boot(instance.name,
                                              certificate_required)
 
+        self.update_vm_resources(instance, vm_gen, image_meta)
+
+    def update_vm_resources(self, instance, vm_gen, image_meta,
+                            instance_path=None, is_resize=False):
+        """Updates the VM's reconfigurable resources."""
+        memory_per_numa_node, cpus_per_numa_node = (
+            self._get_instance_vnuma_config(instance, image_meta))
+        vnuma_enabled = bool(memory_per_numa_node)
+
+        dynamic_memory_ratio = self._get_instance_dynamic_memory_ratio(
+            instance, vnuma_enabled)
+
+        host_shutdown_action = (
+            os_win_const.HOST_SHUTDOWN_ACTION_SHUTDOWN
+            if CONF.hyperv.instance_automatic_shutdown
+            else None)
+
+        self._vmutils.update_vm(instance.name,
+                                instance.memory_mb,
+                                memory_per_numa_node,
+                                instance.vcpus,
+                                cpus_per_numa_node,
+                                CONF.hyperv.limit_cpu_features,
+                                dynamic_memory_ratio,
+                                configuration_root_dir=instance_path,
+                                host_shutdown_action=host_shutdown_action,
+                                vnuma_enabled=vnuma_enabled)
+
+        self._set_instance_disk_qos_specs(instance, is_resize)
+
+    def _get_instance_dynamic_memory_ratio(self, instance, vnuma_enabled):
+        dynamic_memory_ratio = CONF.hyperv.dynamic_memory_ratio
+        if vnuma_enabled:
+            LOG.debug("Instance requires vNUMA topology. Host's NUMA spanning "
+                      "has to be disabled in order for the instance to "
+                      "benefit from it.", instance=instance)
+            if CONF.hyperv.dynamic_memory_ratio > 1.0:
+                LOG.warning(_LW(
+                    "Instance vNUMA topology requested, but dynamic memory "
+                    "ratio is higher than 1.0 in nova.conf. Ignoring dynamic "
+                    "memory ratio option."), instance=instance)
+            dynamic_memory_ratio = 1.0
+        return dynamic_memory_ratio
+
     def _attach_root_device(self, instance_name, root_dev_info):
         if root_dev_info['type'] == constants.VOLUME:
             self._volumeops.attach_volume(root_dev_info['connection_info'],
@@ -488,7 +502,7 @@ class VMOps(object):
                                root_dev_info['disk_bus'],
                                root_dev_info['type'])
 
-    def _attach_ephemerals(self, instance_name, ephemerals):
+    def attach_ephemerals(self, instance_name, ephemerals):
         for eph in ephemerals:
             self._attach_drive(
                 instance_name, eph['path'], eph['drive_addr'],
@@ -615,7 +629,25 @@ class VMOps(object):
 
         return memory_per_numa_node, cpus_per_numa_node
 
-    def _configure_remotefx(self, instance, vm_gen, config):
+    def configure_remotefx(self, instance, vm_gen, is_resize=False):
+        """Configures RemoteFX for the given instance.
+
+        The given instance must be a realized VM before changing any RemoteFX
+        configurations.
+        """
+        extra_specs = instance.flavor.extra_specs
+        config = extra_specs.get(
+            constants.FLAVOR_REMOTE_FX_EXTRA_SPEC_KEY)
+        if not config:
+            # RemoteFX not required.
+            if is_resize and instance.old_flavor.extra_specs.get(
+                    constants.FLAVOR_REMOTE_FX_EXTRA_SPEC_KEY):
+                # the instance was resized from a RemoteFX flavor to one
+                # without RemoteFX. We need to disable RemoteFX on the
+                # instance.
+                self._vmutils.disable_remotefx_video_adapter(instance.name)
+            return
+
         if not CONF.hyperv.enable_remotefx:
             reason = _("enable_remotefx configuration option needs to be set "
                        "to True in order to use RemoteFX")
@@ -1068,9 +1100,11 @@ class VMOps(object):
         vif_driver.unplug(instance, vif)
         self._vmutils.destroy_nic(instance.name, vif['id'])
 
-    def _set_instance_disk_qos_specs(self, instance):
+    def _set_instance_disk_qos_specs(self, instance, is_resize):
         min_iops, max_iops = self._get_storage_qos_specs(instance)
-        if min_iops or max_iops:
+        if min_iops or max_iops or is_resize:
+            # NOTE(claudiub): the instance might have been "resized" to a
+            # flavor with no QoS specs. We need to set them to 0 in this case.
             local_disks = self._get_instance_local_disks(instance.name)
             for disk_path in local_disks:
                 self._vmutils.set_disk_qos_specs(disk_path,

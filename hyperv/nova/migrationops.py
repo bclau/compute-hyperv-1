@@ -17,18 +17,18 @@
 Management class for migration / resize operations.
 """
 import os
-import shutil
+import re
 
 from nova import exception
 from nova.virt import configdrive
 from nova.virt import driver
 from os_win import utilsfactory
+from oslo_config import cfg
 from oslo_log import log as logging
 from oslo_utils import excutils
 from oslo_utils import units
-from oslo_serialization import jsonutils
 
-from hyperv.i18n import _, _LE
+from hyperv.i18n import _, _LW
 from hyperv.nova import block_device_manager
 from hyperv.nova import constants
 from hyperv.nova import imagecache
@@ -37,9 +37,20 @@ from hyperv.nova import vmops
 from hyperv.nova import volumeops
 
 LOG = logging.getLogger(__name__)
+CONF = cfg.CONF
+
+hyperv_migration_opts = [
+    cfg.BoolOpt('move_disks_on_cold_migration',
+                default=True)
+]
+
+CONF.register_opts(hyperv_migration_opts, 'hyperv')
 
 
 class MigrationOps(object):
+
+    _ADMINISTRATIVE_SHARE_RE = re.compile(r'\\\\.*\\[a-zA-Z]\$\\.*')
+
     def __init__(self):
         self._vmutils = utilsfactory.get_vmutils()
         self._vhdutils = utilsfactory.get_vhdutils()
@@ -47,58 +58,24 @@ class MigrationOps(object):
         self._volumeops = volumeops.VolumeOps()
         self._vmops = vmops.VMOps()
         self._imagecache = imagecache.ImageCache()
-        self._block_dev_manager = block_device_manager.BlockDeviceInfoManager()
+        self._block_dev_man = block_device_manager.BlockDeviceInfoManager()
+        self._migrationutils = utilsfactory.get_migrationutils()
+        self._metricsutils = utilsfactory.get_metricsutils()
 
-    def _move_disk_files(self, instance, disk_files, dest):
-        # TODO(mikal): it would be nice if this method took a full instance,
-        # because it could then be passed to the log messages below.
-
-        disk_info = []
-        instance_name = instance.name
-
-        instance_path = self._pathutils.get_instance_dir(instance_name)
-        temp_path = self._pathutils.get_instnace_migr_temp_dir(instance_name,
-            remove_dir=True, create_dir=True)
+    def _move_vm_files(self, instance):
+        instance_path = self._pathutils.get_instance_dir(instance.name)
         revert_path = self._pathutils.get_instance_migr_revert_dir(
-            instance_name, remove_dir=True, create_dir=True)
+            instance_path, remove_dir=True, create_dir=True)
+        export_path = self._pathutils.get_export_dir(
+            instance_dir=revert_path, create_dir=True)
 
-        # We destroy the instance so that the instance dir may be moved. Also,
-        # we fetch the instane dir first as we rely on the instance to exist
-        # in order to locate it if residing at a different location than the
-        # configured one.
-        self._vmops.destroy(instance, destroy_disks=False)
+        # copy the given instance's files to a _revert folder, as backup.
+        LOG.debug("Moving instance files to a revert path: %s",
+                  revert_path, instance=instance)
+        self._pathutils.move_folder_files(instance_path, revert_path)
+        self._pathutils.copy_vm_config_files(instance.name, export_path)
 
-        try:
-            for disk_file in disk_files:
-                LOG.debug('Copying disk "%(disk_files)s" to temporary path '
-                      '"%(temp_path)s"',
-                      {'disk_files': disk_files, 'temp_path': temp_path})
-                self._pathutils.copy(disk_file, temp_path)
-                disk_file_name = os.path.basename(disk_file)
-                disk_info.append({
-                        "path": os.path.join(temp_path, disk_file_name)
-                    })
-
-            # TODO(lpetrut): we should switch to using win32 api when os-win
-            # supports this.
-            shutil.move(instance_path, revert_path)
-            return disk_info
-        except Exception:
-            with excutils.save_and_reraise_exception():
-                self._cleanup_failed_disk_migration(instance_path, revert_path,
-                                                    temp_path)
-
-    def _cleanup_failed_disk_migration(self, instance_path,
-                                       revert_path, temp_path):
-        try:
-            if temp_path and self._pathutils.exists(temp_path):
-                self._pathutils.rmtree(temp_path)
-            if self._pathutils.exists(revert_path):
-                shutil.move(revert_path, instance_path)
-        except Exception as ex:
-            # Log and ignore this exception
-            LOG.exception(ex)
-            LOG.error(_LE("Cannot cleanup migration files"))
+        return revert_path
 
     def _check_target_flavor(self, instance, flavor, block_device_info):
         new_root_gb = flavor.root_gb
@@ -136,34 +113,32 @@ class MigrationOps(object):
         self._check_target_flavor(instance, flavor, block_device_info)
 
         self._vmops.power_off(instance, timeout, retry_interval)
+        instance_path = self._move_vm_files(instance)
 
-        (disk_files,
-         volume_drives) = self._vmutils.get_vm_storage_paths(instance.name)
+        instance.system_metadata['backup_location'] = instance_path
+        instance.save()
 
-        if disk_files:
-            disk_info = self._move_disk_files(instance, disk_files, dest)
-        else:
-            disk_info = []
-            self._vmops.destroy(instance, destroy_disks=False)
+        self._vmops.destroy(instance, destroy_disks=True)
 
-        # disk_info is a list of dicts, each representing a disk
-        return jsonutils.dumps(disk_info)
+        # return the instance's path location.
+        return instance_path
 
     def confirm_migration(self, migration, instance, network_info):
         LOG.debug("confirm_migration called", instance=instance)
+        revert_path = instance.system_metadata['backup_location']
+        export_path = self._pathutils.get_export_dir(instance_dir=revert_path)
+        self._pathutils.check_dir(export_path, remove_dir=True)
+        self._pathutils.check_dir(revert_path, remove_dir=True)
 
-        self._pathutils.get_instance_migr_revert_dir(instance.name,
-                                                     remove_dir=True)
-        self._pathutils.get_instnace_migr_temp_dir(instance.name,
-                                                   remove_dir=True)
+    def _revert_migration_files(self, instance):
+        revert_path = instance.system_metadata['backup_location']
+        instance_path = revert_path.rstrip('_revert')
 
-    def _revert_migration_files(self, instance_name):
-        instance_path = self._pathutils.get_instance_dir(
-            instance_name, create_dir=False, remove_dir=True)
-
-        revert_path = self._pathutils.get_instance_migr_revert_dir(
-            instance_name)
+        # the instance dir might still exist, if the destination node kept
+        # the files on the original node.
+        self._pathutils.check_dir(instance_path, remove_dir=True)
         self._pathutils.rename(revert_path, instance_path)
+        return instance_path
 
     def _check_and_attach_config_drive(self, instance, vm_gen):
         if configdrive.required_by(instance):
@@ -179,34 +154,12 @@ class MigrationOps(object):
     def finish_revert_migration(self, context, instance, network_info,
                                 block_device_info=None, power_on=True):
         LOG.debug("finish_revert_migration called", instance=instance)
-
-        instance_name = instance.name
-        self._revert_migration_files(instance_name)
+        instance_path = self._revert_migration_files(instance)
 
         image_meta = self._imagecache.get_image_details(context, instance)
-        vm_gen = self._vmops.get_image_vm_generation(instance.uuid, image_meta)
+        self._import_and_setup_vm(context, instance, instance_path, image_meta,
+                                  block_device_info)
 
-        self._block_dev_manager.validate_and_update_bdi(
-            instance, image_meta, vm_gen, block_device_info)
-        root_device = block_device_info['root_disk']
-
-        if root_device['type'] == constants.DISK:
-            root_device['path'] = self._pathutils.lookup_root_vhd_path(
-                instance_name)
-            if not root_device['path']:
-                raise exception.DiskNotFound(
-                    _("Cannot find boot VHD file for instance: %s")
-                    % instance_name)
-
-        ephemerals = block_device_info['ephemerals']
-        self._check_ephemeral_disks(instance, ephemerals)
-
-        self._vmops.create_instance(instance, network_info,
-                                    root_device, block_device_info, vm_gen,
-                                    image_meta)
-
-        self._check_and_attach_config_drive(instance, vm_gen)
-        self._vmops.set_boot_order(vm_gen, block_device_info, instance_name)
         if power_on:
             self._vmops.power_on(instance, network_info=network_info)
 
@@ -279,62 +232,151 @@ class MigrationOps(object):
             self._vhdutils.reconnect_parent_vhd(diff_vhd_path,
                                                 base_vhd_path)
 
+    def _migrate_disks_from_source(self, migration, instance,
+                                   source_inst_dir):
+        source_inst_dir = self._pathutils.get_remote_path(
+            migration.source_compute, source_inst_dir)
+        source_export_path = self._pathutils.get_export_dir(
+            instance_dir=source_inst_dir)
+
+        if CONF.hyperv.move_disks_on_cold_migration:
+            # copy the files from the source node to this node's configured
+            # location.
+            inst_dir = self._pathutils.get_instance_dir(
+                instance.name, create_dir=True, remove_dir=True)
+        elif self._ADMINISTRATIVE_SHARE_RE.match(source_inst_dir):
+            # make sure that the source is not a remote local path.
+            # e.g.: \\win-srv\\C$\OpenStack\Instances\..
+            # CSVs, local paths, and shares are fine.
+            inst_dir = source_inst_dir.rstrip('_revert')
+            LOG.warning(_LW(
+                'Host is configured not to copy disks on cold migration, but '
+                'the instance will not be able to start with the remote path: '
+                '"%s". Only local, share, or CSV paths are acceptable.'),
+                inst_dir)
+            inst_dir = self._pathutils.get_instance_dir(
+                instance.name, create_dir=True, remove_dir=True)
+        else:
+            # make a copy on the source node's configured location.
+            # strip the _revert from the source backup dir.
+            inst_dir = source_inst_dir.rstrip('_revert')
+            self._pathutils.check_dir(inst_dir, create_dir=True)
+
+        export_path = self._pathutils.get_export_dir(
+            instance_dir=inst_dir)
+
+        self._pathutils.copy_folder_files(source_inst_dir, inst_dir)
+        self._pathutils.copy_dir(source_export_path, export_path)
+        return inst_dir
+
     def finish_migration(self, context, migration, instance, disk_info,
                          network_info, image_meta, resize_instance=False,
                          block_device_info=None, power_on=True):
         LOG.debug("finish_migration called", instance=instance)
+        instance_dir = self._migrate_disks_from_source(migration, instance,
+                                                       disk_info)
 
-        self._migrate_disks_from_source(migration, instance, disk_info)
+        # NOTE(claudiub): nova compute manager only takes into account disk
+        # flavor changes when passing to the driver resize_instance=True.
+        # we need to take into account flavor extra_specs as well.
+        resize_instance = (migration['old_instance_type_id'] !=
+                           migration['new_instance_type_id'])
 
-        instance_name = instance.name
+        self._import_and_setup_vm(context, instance, instance_dir, image_meta,
+                                  block_device_info, resize_instance)
 
+        if power_on:
+            self._vmops.power_on(instance, network_info=network_info)
+
+    def _import_and_setup_vm(self, context, instance, instance_dir, image_meta,
+                             block_device_info, resize_instance=False):
         vm_gen = self._vmops.get_image_vm_generation(instance.uuid, image_meta)
+        self._import_vm(instance_dir)
+        self._volumeops.connect_volumes(block_device_info)
 
-        self._block_dev_manager.validate_and_update_bdi(
-            instance, image_meta, vm_gen, block_device_info)
+
+        self._update_disk_image_paths(instance, instance_dir)
+        self._check_and_update_disks(context, instance, vm_gen, image_meta,
+                                     block_device_info,
+                                     resize_instance=resize_instance)
+        self._volumeops.fix_instance_volume_disk_paths(
+            instance.name, block_device_info)
+
+        self._vmops.update_vm_resources(instance, vm_gen, image_meta,
+                                        instance_dir, resize_instance)
+
+        self._migrationutils.realize_vm(instance.name)
+
+        self._vmops.configure_remotefx(instance, vm_gen, resize_instance)
+        if CONF.hyperv.enable_instance_metrics_collection:
+            self._metricsutils.enable_vm_metrics_collection(instance.name)
+
+    def _import_vm(self, instance_dir):
+        snapshot_dir = self._pathutils.get_instance_snapshot_dir(
+            instance_dir=instance_dir)
+        export_dir = self._pathutils.get_export_dir(instance_dir=instance_dir)
+        vm_config_file_path = self._pathutils.get_vm_config_file(export_dir)
+
+        self._migrationutils.import_vm_definition(vm_config_file_path,
+                                                  snapshot_dir)
+
+        # NOTE(claudiub): after the VM was imported, the VM config files are
+        # not necessary anymore.
+        self._pathutils.get_export_dir(instance_dir=instance_dir,
+                                       remove_dir=True)
+
+    def _update_disk_image_paths(self, instance, instance_path):
+        """Checks if disk images have the correct path and updates them if not.
+
+        When resizing an instance, the vm is imported on the destination node
+        and the disk files are copied from source node. If the hosts have
+        different instance_path config options set, the disks are migrated to
+        the correct paths, but vm disk resources are not updated to point to
+        the new location.
+        """
+        (disk_files, volume_drives) = self._vmutils.get_vm_storage_paths(
+            instance.name)
+
+        pattern = re.compile('configdrive|eph|root')
+        for disk_file in disk_files:
+            disk_name = os.path.basename(disk_file)
+            expected_disk_path = os.path.join(instance_path, disk_name)
+            if not os.path.exists(expected_disk_path):
+                raise exception.DiskNotFound(location=expected_disk_path)
+
+            if pattern.match(disk_name) and expected_disk_path != disk_file:
+                LOG.debug("Updating VM disk location from %(src)s to %(dest)s",
+                          {'src': disk_file, 'dest': expected_disk_path,
+                           'instance': instance})
+                self._vmutils.update_vm_disk_path(disk_file,
+                                                  expected_disk_path,
+                                                  is_physical=False)
+
+    def _check_and_update_disks(self, context, instance, vm_gen, image_meta,
+                                block_device_info, resize_instance=False):
+        self._block_dev_man.validate_and_update_bdi(instance, image_meta,
+                                                    vm_gen, block_device_info)
         root_device = block_device_info['root_disk']
 
         if root_device['type'] == constants.DISK:
-            root_device['path'] = self._pathutils.lookup_root_vhd_path(
-                instance_name)
-            if not root_device['path']:
-                raise exception.DiskNotFound(_("Cannot find boot VHD "
-                                               "file for instance: %s") %
-                                             instance_name)
+            root_vhd_path = self._pathutils.lookup_root_vhd_path(instance.name)
+            root_device['path'] = root_vhd_path
+            if not root_vhd_path:
+                base_vhd_path = self._pathutils.get_instance_dir(instance.name)
+                raise exception.DiskNotFound(location=base_vhd_path)
 
-            root_vhd_info = self._vhdutils.get_vhd_info(root_device['path'])
+            root_vhd_info = self._vhdutils.get_vhd_info(root_vhd_path)
             src_base_disk_path = root_vhd_info.get("ParentPath")
             if src_base_disk_path:
-                self._check_base_disk(context, instance, root_device['path'],
+                self._check_base_disk(context, instance, root_vhd_path,
                                       src_base_disk_path)
 
             if resize_instance:
                 new_size = instance.root_gb * units.Gi
-                self._check_resize_vhd(root_device['path'], root_vhd_info,
-                                       new_size)
+                self._check_resize_vhd(root_vhd_path, root_vhd_info, new_size)
 
         ephemerals = block_device_info['ephemerals']
         self._check_ephemeral_disks(instance, ephemerals, resize_instance)
-
-        self._vmops.create_instance(instance, network_info, root_device,
-                                    block_device_info, vm_gen, image_meta)
-
-        self._check_and_attach_config_drive(instance, vm_gen)
-        self._vmops.set_boot_order(vm_gen, block_device_info, instance_name)
-        if power_on:
-            self._vmops.power_on(instance)
-
-    def _migrate_disks_from_source(self, migration, instance, disk_info):
-
-        disk_info = jsonutils.loads(disk_info)
-        instance_dir = self._pathutils.get_instance_dir(instance.name,
-                                                        create_dir=True)
-        # we process disks individually, assuming they weren't all moved to
-        # the same path, though this should never be the case
-        for disk in disk_info:
-            disk_path = self._pathutils._get_remote_unc_path(
-                migration.source_compute, disk['path'])
-            self._pathutils.copy(disk_path, instance_dir)
 
     def _check_ephemeral_disks(self, instance, ephemerals,
                                resize_instance=False):

@@ -19,8 +19,6 @@ from eventlet import timeout as etimeout
 import mock
 from nova.compute import vm_states
 from nova import exception
-from nova.objects import flavor as flavor_obj
-from nova.tests.unit.objects import test_flavor
 from nova.tests.unit.objects import test_virtual_interface
 from nova.virt import hardware
 from os_win import constants as os_win_const
@@ -524,33 +522,29 @@ class VMOpsTestCase(test_base.HyperVBaseTestCase):
         self.assertEqual([('network-vif-plugged', mock.sentinel.vif_id2)],
                          events)
 
+    @mock.patch.object(vmops.VMOps, 'update_vm_resources')
     @mock.patch.object(vmops.VMOps, '_requires_secure_boot')
     @mock.patch.object(vmops.VMOps, '_requires_certificate')
     @mock.patch('hyperv.nova.vif.get_vif_driver')
-    @mock.patch.object(vmops.VMOps, '_set_instance_disk_qos_specs')
+    @mock.patch.object(vmops.VMOps, '_get_instance_vnuma_config')
     @mock.patch.object(vmops.volumeops.VolumeOps, 'attach_volumes')
     @mock.patch.object(vmops.VMOps, '_attach_root_device')
-    @mock.patch.object(vmops.VMOps, '_attach_ephemerals')
+    @mock.patch.object(vmops.VMOps, 'configure_remotefx')
     @mock.patch.object(vmops.VMOps, '_get_image_serial_port_settings')
     @mock.patch.object(vmops.VMOps, '_create_vm_com_port_pipes')
-    @mock.patch.object(vmops.VMOps, '_configure_remotefx')
-    @mock.patch.object(vmops.VMOps, '_get_instance_vnuma_config')
-    def _test_create_instance(self, mock_get_instance_vnuma_config,
-                              mock_configure_remotefx, mock_create_pipes,
-                              mock_get_port_settings, mock_attach_ephemerals,
-                              mock_attach_root_device, mock_attach_volumes,
-                              mock_set_qos_specs, mock_get_vif_driver,
-                              mock_requires_certificate,
-                              mock_requires_secure_boot,
-                              enable_instance_metrics=True,
-                              vm_gen=constants.VM_GEN_1, vnuma_enabled=False,
-                              requires_sec_boot=True, remotefx=False,
-                              instance_automatic_shutdown=False):
-        mock_vif_driver = mock_get_vif_driver()
-        self.flags(dynamic_memory_ratio=2.0, group='hyperv')
-        self.flags(enable_instance_metrics_collection=enable_instance_metrics,
-                   group='hyperv')
-        self.flags(instance_automatic_shutdown=instance_automatic_shutdown,
+    @mock.patch.object(vmops.VMOps, 'attach_ephemerals')
+    def test_create_instance(self, mock_attach_ephemerals,
+                             mock_create_pipes,
+                             mock_get_port_settings,
+                             mock_configure_remotefx,
+                             mock_attach_root_device,
+                             mock_attach_volumes,
+                             mock_get_vnuma_config,
+                             mock_get_vif_driver,
+                             mock_requires_certificate,
+                             mock_requires_secure_boot,
+                             mock_update_vm_resources):
+        self.flags(enable_instance_metrics_collection=True,
                    group='hyperv')
         root_device_info = mock.sentinel.ROOT_DEV_INFO
         block_device_info = {'ephemerals': [], 'block_device_mapping': []}
@@ -558,122 +552,102 @@ class VMOpsTestCase(test_base.HyperVBaseTestCase):
                              'address': mock.sentinel.ADDRESS}
         mock_instance = fake_instance.fake_instance_obj(self.context)
         instance_path = os.path.join(CONF.instances_path, mock_instance.name)
-        mock_requires_secure_boot.return_value = requires_sec_boot
 
+        mock_get_vnuma_config.return_value = (mock.sentinel.mem_per_numa_node,
+                                              mock.sentinel.vnuma_cpus)
+
+        self._vmops.create_instance(context=self.context,
+                                    instance=mock_instance,
+                                    network_info=[fake_network_info],
+                                    block_device_info=block_device_info,
+                                    vm_gen=mock.sentinel.vm_gen,
+                                    image_meta=mock.sentinel.image_meta)
+
+        mock_get_vnuma_config.assert_called_once_with(mock_instance,
+                                                      mock.sentinel.image_meta)
+        self._vmops._vmutils.create_vm.assert_called_once_with(
+            mock_instance.name, True, mock.sentinel.vm_gen,
+            instance_path, [mock_instance.uuid])
+
+        mock_configure_remotefx.assert_called_once_with(mock_instance,
+                                                        mock.sentinel.vm_gen)
+
+        mock_create_scsi_ctrl = self._vmops._vmutils.create_scsi_controller
+        mock_create_scsi_ctrl.assert_called_once_with(mock_instance.name)
+
+        mock_attach_root_device.assert_called_once_with(mock_instance.name,
+            root_device_info)
+        mock_attach_ephemerals.assert_called_once_with(mock_instance.name,
+            block_device_info['ephemerals'])
+        mock_attach_volumes.assert_called_once_with(
+            block_device_info['block_device_mapping'], mock_instance.name)
+
+        mock_get_port_settings.assert_called_with(mock.sentinel.image_meta)
+        mock_create_pipes.assert_called_once_with(
+            mock_instance, mock_get_port_settings.return_value)
+
+        self._vmops._vmutils.create_nic.assert_called_once_with(
+            mock_instance.name, mock.sentinel.ID, mock.sentinel.ADDRESS)
+        mock_enable = self._vmops._metricsutils.enable_vm_metrics_collection
+        mock_enable.assert_called_once_with(mock_instance.name)
+        mock_requires_secure_boot.assert_called_once_with(
+            mock_instance, mock.sentinel.image_meta, mock.sentinel.vm_gen)
+        mock_requires_certificate.assert_called_once_with(
+            mock.sentinel.image_meta)
+        enable_secure_boot = self._vmops._vmutils.enable_secure_boot
+        enable_secure_boot.assert_called_once_with(
+            mock_instance.name,
+            msft_ca_required=mock_requires_certificate.return_value)
+        mock_update_vm_resources.assert_called_once_with(
+            mock_instance, mock.sentinel.vm_gen, mock.sentinel.image_meta)
+
+    @mock.patch.object(vmops.VMOps, '_set_instance_disk_qos_specs')
+    @mock.patch.object(vmops.VMOps, '_get_instance_dynamic_memory_ratio')
+    @mock.patch.object(vmops.VMOps, '_get_instance_vnuma_config')
+    def _check_update_vm_resources(self, mock_get_vnuma_config,
+                                   mock_get_dynamic_memory_ratio,
+                                   mock_configure_remotefx,
+                                   mock_set_qos_specs):
+        self.flags(instance_automatic_shutdown=True, group='hyperv')
+        mock_get_vnuma_config.return_value = (mock.sentinel.mem_per_numa_node,
+                                              mock.sentinel.vnuma_cpus)
+        dynamic_memory_ratio = mock_get_dynamic_memory_ratio.return_value
+        mock_instance = fake_instance.fake_instance_obj(self.context)
+
+        self._vmops.update_vm_resources(mock_instance, mock.sentinel.vm_gen,
+                                        mock.sentinel.image_meta,
+                                        mock.sentinel.instance_path,
+                                        mock.sentinel.is_resize)
+
+        mock_get_vnuma_config.assert_called_once_with(mock_instance,
+                                                      mock.sentinel.image_meta)
+        mock_get_dynamic_memory_ratio.assert_called_once_with(
+            mock_instance, True)
+        self._vmops._vmutils.update_vm.assert_called_once_with(
+            mock_instance.name, mock_instance.flavor.memory_mb,
+            mock.sentinel.mem_per_numa_node, mock_instance.flavor.vcpus,
+            mock.sentinel.vnuma_cpus, CONF.hyperv.limit_cpu_features,
+            dynamic_memory_ratio,
+            configuration_root_dir=mock.sentinel.instance_path,
+            host_shutdown_action=os_win_const.HOST_SHUTDOWN_ACTION_SHUTDOWN,
+            vnuma_enabled=True)
+        mock_set_qos_specs.assert_called_once_with(mock_instance,
+                                                   mock.sentinel.is_resize)
+
+    def test_update_vm_resources(self):
+        self._check_update_vm_resources()
+
+    @ddt.data(True, False)
+    def test_get_instance_dynamic_memory_ratio(self, vnuma_enabled):
+        expected_dyn_memory_ratio = 2.0
+        self.flags(dynamic_memory_ratio=expected_dyn_memory_ratio,
+                   group='hyperv')
         if vnuma_enabled:
-            mock_get_instance_vnuma_config.return_value = (
-                mock.sentinel.mem_per_numa, mock.sentinel.cpus_per_numa)
-            cpus_per_numa = mock.sentinel.numa_cpus
-            mem_per_numa = mock.sentinel.mem_per_numa
-            dynamic_memory_ratio = 1.0
-        else:
-            mock_get_instance_vnuma_config.return_value = (None, None)
-            mem_per_numa, cpus_per_numa = (None, None)
-            dynamic_memory_ratio = CONF.hyperv.dynamic_memory_ratio
+            expected_dyn_memory_ratio = 1.0
 
-        exp_host_shutdown_action = (
-            os_win_const.HOST_SHUTDOWN_ACTION_SHUTDOWN
-            if CONF.hyperv.instance_automatic_shutdown
-            else None)
-
-        flavor = flavor_obj.Flavor(**test_flavor.fake_flavor)
-        if remotefx is True:
-            flavor.extra_specs['hyperv:remotefx'] = "1920x1200,2"
-        mock_instance.flavor = flavor
-
-        if remotefx is True and vm_gen == constants.VM_GEN_2:
-            self.assertRaises(os_win_exc.HyperVException,
-                              self._vmops.create_instance,
-                              instance=mock_instance,
-                              network_info=[fake_network_info],
-                              block_device_info=block_device_info,
-                              root_device=root_device_info,
-                              vm_gen=vm_gen,
-                              image_meta=mock.sentinel.image_meta,
-                              host_shutdown_action=exp_host_shutdown_action)
-        else:
-            self._vmops.create_instance(
-                    instance=mock_instance,
-                    network_info=[fake_network_info],
-                    block_device_info=block_device_info,
-                    root_device=root_device_info,
-                    vm_gen=vm_gen,
-                    image_meta=mock.sentinel.image_meta,
-                    host_shutdown_action=exp_host_shutdown_action)
-            if remotefx is True:
-                mock_configure_remotefx.assert_called_once_with(
-                    mock_instance,
-                    vm_gen,
-                    flavor.extra_specs['hyperv:remotefx'])
-
-            self._vmops._vmutils.create_vm.assert_called_once_with(
-                mock_instance.name, vnuma_enabled, vm_gen,
-                instance_path, [mock_instance.uuid])
-            self._vmops._vmutils.update_vm.assert_called_once_with(
-                mock_instance.name, mock_instance.memory_mb, mem_per_numa,
-                mock_instance.vcpus, cpus_per_numa,
-                CONF.hyperv.limit_cpu_features, dynamic_memory_ratio,
-                host_shutdown_action=exp_host_shutdown_action)
-
-            mock_create_scsi_ctrl = self._vmops._vmutils.create_scsi_controller
-            mock_create_scsi_ctrl.assert_called_once_with(mock_instance.name)
-
-            mock_attach_root_device.assert_called_once_with(mock_instance.name,
-                root_device_info)
-            mock_attach_ephemerals.assert_called_once_with(mock_instance.name,
-                block_device_info['ephemerals'])
-            mock_attach_volumes.assert_called_once_with(
-                block_device_info['block_device_mapping'], mock_instance.name)
-
-            mock_get_port_settings.assert_called_with(mock.sentinel.image_meta)
-            mock_create_pipes.assert_called_once_with(
-                mock_instance, mock_get_port_settings.return_value)
-
-            self._vmops._vmutils.create_nic.assert_called_once_with(
-                mock_instance.name, mock.sentinel.ID, mock.sentinel.ADDRESS)
-            mock_vif_driver.plug.assert_called_once_with(mock_instance,
-                                                         fake_network_info)
-            mock_enable = (
-                self._vmops._metricsutils.enable_vm_metrics_collection)
-            if enable_instance_metrics:
-                mock_enable.assert_called_once_with(mock_instance.name)
-            mock_set_qos_specs.assert_called_once_with(mock_instance)
-            if requires_sec_boot:
-                mock_requires_secure_boot.assert_called_once_with(
-                    mock_instance, mock.sentinel.image_meta, vm_gen)
-                mock_requires_certificate.assert_called_once_with(
-                    mock_instance.uuid,
-                    mock.sentinel.image_meta)
-                enable_secure_boot = self._vmops._vmutils.enable_secure_boot
-                enable_secure_boot.assert_called_once_with(
-                    mock_instance.name, mock_requires_certificate.return_value)
-
-    def test_create_instance(self):
-        self._test_create_instance()
-
-    def test_create_instance_exception(self):
-        # Secure Boot requires Generation 2 VMs. If boot is required while the
-        # vm_gen is 1, exception is raised.
-        self._test_create_instance(enable_instance_metrics=True,
-                                   vm_gen=constants.VM_GEN_1)
-
-    def test_create_instance_enable_instance_metrics_false(self):
-        self._test_create_instance(enable_instance_metrics=False)
-
-    def test_create_instance_gen2(self):
-        self._test_create_instance(enable_instance_metrics=False,
-                                   vm_gen=constants.VM_GEN_2)
-
-    def test_create_instance_with_remote_fx(self):
-        self._test_create_instance(enable_instance_metrics=False,
-                                   remotefx=True)
-
-    def test_create_instance_with_remote_fx_gen2(self):
-        self._test_create_instance(enable_instance_metrics=False,
-                                   remotefx=True)
-
-    def test_create_instance_automatic_shutdown(self):
-        self._test_create_instance(instance_automatic_shutdown=True)
+        response = self._vmops._get_instance_dynamic_memory_ratio(
+            mock.sentinel.instance, vnuma_enabled)
+        self.assertEqual(expected_dyn_memory_ratio, response)
 
     @mock.patch.object(vmops.volumeops.VolumeOps, 'attach_volume')
     def test_attach_root_device_volume(self, mock_attach_volume):
@@ -722,7 +696,7 @@ class VMOpsTestCase(test_base.HyperVBaseTestCase):
                        'drive_addr': 0,
                        'ctrl_disk_addr': 0}]
 
-        self._vmops._attach_ephemerals(mock_instance.name, ephemerals)
+        self._vmops.attach_ephemerals(mock_instance.name, ephemerals)
 
         mock_attach_drive.assert_has_calls(
             [mock.call(mock_instance.name, mock.sentinel.PATH1, 0,
@@ -1517,6 +1491,8 @@ class VMOpsTestCase(test_base.HyperVBaseTestCase):
         fake_vram_mb = 64
         fake_config = "%s,%s,%s" % (
             fake_resolution, fake_monitor_count, fake_vram_mb)
+        mock_instance.flavor.extra_specs[
+            constants.FLAVOR_REMOTE_FX_EXTRA_SPEC_KEY] = fake_config
 
         enable_remotefx = self._vmops._vmutils.enable_remotefx_video_adapter
 
@@ -1547,6 +1523,20 @@ class VMOpsTestCase(test_base.HyperVBaseTestCase):
 
     def test_configure_remotefx(self):
         self._test_configure_remotefx(fail=False)
+
+    def test_configure_remotefx_not_required(self):
+        self.flags(enable_remotefx=False, group='hyperv')
+        mock_instance = fake_instance.fake_instance_obj(self.context)
+
+        mock_instance.old_flavor.extra_specs[
+            constants.FLAVOR_REMOTE_FX_EXTRA_SPEC_KEY] = (
+                os_win_const.REMOTEFX_MAX_RES_1920x1200)
+
+        self._vmops.configure_remotefx(mock_instance, mock.sentinel.VM_GEN,
+                                       True)
+
+        disable_remotefx = self._vmops._vmutils.disable_remotefx_video_adapter
+        disable_remotefx.assert_called_once_with(mock_instance.name)
 
     @mock.patch.object(vmops.VMOps, '_get_vif_driver')
     def test_unplug_vifs(self, mock_get_vif_driver):
@@ -1750,9 +1740,14 @@ class VMOpsTestCase(test_base.HyperVBaseTestCase):
 
         self.assertEqual(fake_local_disks, ret_val)
 
+    @ddt.data((1, True),
+              (0, True),
+              (0, False))
+    @ddt.unpack
     @mock.patch.object(vmops.VMOps, '_get_storage_qos_specs')
     @mock.patch.object(vmops.VMOps, '_get_instance_local_disks')
-    def test_set_instance_disk_qos_specs(self, mock_get_local_disks,
+    def test_set_instance_disk_qos_specs(self, total_iops_sec, is_resize,
+                                         mock_get_local_disks,
                                          mock_get_qos_specs):
         mock_instance = fake_instance.fake_instance_obj(self.context)
         mock_local_disks = [mock.sentinel.root_vhd_path,
@@ -1760,16 +1755,19 @@ class VMOpsTestCase(test_base.HyperVBaseTestCase):
 
         mock_get_local_disks.return_value = mock_local_disks
         mock_set_qos_specs = self._vmops._vmutils.set_disk_qos_specs
-        mock_get_qos_specs.return_value = [mock.sentinel.min_iops,
-                                           mock.sentinel.max_iops]
+        mock_get_qos_specs.return_value = [0, total_iops_sec]
 
-        self._vmops._set_instance_disk_qos_specs(mock_instance)
-        mock_get_local_disks.assert_called_once_with(mock_instance.name)
-        expected_calls = [mock.call(disk_path,
-                                    mock.sentinel.max_iops,
-                                    mock.sentinel.min_iops)
-                          for disk_path in mock_local_disks]
-        mock_set_qos_specs.assert_has_calls(expected_calls)
+        self._vmops._set_instance_disk_qos_specs(mock_instance, is_resize)
+
+        if total_iops_sec or is_resize:
+            mock_get_local_disks.assert_called_once_with(mock_instance.name)
+            expected_calls = [mock.call(disk_path,
+                                        total_iops_sec, 0)
+                              for disk_path in mock_local_disks]
+            mock_set_qos_specs.assert_has_calls(expected_calls)
+        else:
+            self.assertFalse(mock_get_local_disks.called)
+            self.assertFalse(mock_set_qos_specs.called)
 
     @mock.patch.object(volumeops.VolumeOps, 'parse_disk_qos_specs')
     def test_get_storage_qos_specs(self, mock_parse_specs):

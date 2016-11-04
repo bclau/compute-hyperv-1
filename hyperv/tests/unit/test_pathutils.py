@@ -41,6 +41,24 @@ class PathUtilsTestCase(test_base.HyperVBaseTestCase):
         self._pathutils._smbutils = mock.MagicMock()
         self._smbutils = self._pathutils._smbutils
 
+    @mock.patch.object(pathutils.PathUtils, 'copy')
+    @mock.patch.object(os.path, 'isfile')
+    @mock.patch.object(os, 'listdir')
+    def test_copy_folder_files(self, mock_listdir, mock_isfile, mock_copy):
+        src_dir = 'src'
+        dest_dir = 'dest'
+        fname = 'tmp_file.txt'
+        subdir = 'tmp_folder'
+        src_fname = os.path.join(src_dir, fname)
+        dest_fname = os.path.join(dest_dir, fname)
+
+        # making sure src_subdir is not copied.
+        mock_listdir.return_value = [fname, subdir]
+        mock_isfile.side_effect = [True, False]
+
+        self._pathutils.copy_folder_files(src_dir, dest_dir)
+        mock_copy.assert_called_once_with(src_fname, dest_fname)
+
     @ddt.data({'conf_instances_path': r'c:\inst_dir',
                'expected_dir': r'c:\inst_dir'},
               {'conf_instances_path': r'c:\inst_dir',
@@ -64,8 +82,39 @@ class PathUtilsTestCase(test_base.HyperVBaseTestCase):
 
         self.assertEqual(expected_dir, instances_dir)
 
+    def test_get_remote_path_share(self):
+        fake_remote_path = '\\\\fake_path'
+
+        actual_path = self._pathutils.get_remote_path(mock.sentinel.server,
+                                                      fake_remote_path)
+        self.assertEqual(fake_remote_path, actual_path)
+
+    @mock.patch.object(pathutils.os, 'getenv')
+    def test_get_remote_path_csv(self, mock_getenv):
+        mock_getenv.return_value = 'C:'
+        fake_server = 'fake_server'
+        fake_remote_path = 'C:\\ClusterStorage\\Volume1\\fake_dir'
+
+        actual_path = self._pathutils.get_remote_path(fake_server,
+                                                      fake_remote_path)
+
+        self.assertEqual(fake_remote_path, actual_path)
+        mock_getenv.assert_called_once_with('SYSTEMDRIVE', 'C:')
+
+    def test_get_remote_path_normal(self):
+        fake_server = 'fake_server'
+        fake_remote_path = 'C:\\fake_path'
+
+        actual_path = self._pathutils.get_remote_path(fake_server,
+                                                      fake_remote_path)
+
+        expected_path = ('\\\\%(remote_server)s\\%(path)s' %
+                         dict(remote_server=fake_server,
+                              path=fake_remote_path.replace(':', '$')))
+        self.assertEqual(expected_path, actual_path)
+
     @mock.patch.object(pathutils.PathUtils, 'get_instances_dir')
-    @mock.patch.object(pathutils.PathUtils, '_check_dir')
+    @mock.patch.object(pathutils.PathUtils, 'check_dir')
     def test_get_instances_sub_dir(self, mock_check_dir,
                                    mock_get_instances_dir):
         fake_instances_dir = 'fake_instances_dir'
@@ -96,7 +145,7 @@ class PathUtilsTestCase(test_base.HyperVBaseTestCase):
     @mock.patch.object(pathutils.PathUtils, 'check_remove_dir')
     def test_check_dir(self, mock_check_remove_dir, mock_check_create_dir,
                        create_dir, remove_dir):
-        self._pathutils._check_dir(
+        self._pathutils.check_dir(
             mock.sentinel.dir, create_dir=create_dir, remove_dir=remove_dir)
 
         if create_dir:
@@ -121,9 +170,23 @@ class PathUtilsTestCase(test_base.HyperVBaseTestCase):
         with mock.patch.object(builtins, 'WindowsError',
                                FakeWindowsError, create=True):
             self.assertRaises(exception.AdminRequired,
-                              self._pathutils._check_dir,
+                              self._pathutils.check_dir,
                               mock.sentinel.dir_name,
                               create_dir=True)
+
+    @mock.patch.object(pathutils.PathUtils, 'check_dir')
+    def test_get_instance_migr_revert_dir(self, mock_check_dir):
+        dir_name = 'fake_dir'
+        expected_dir_name = '%s_revert' % dir_name
+
+        revert_dir = self._pathutils.get_instance_migr_revert_dir(
+            dir_name, create_dir=mock.sentinel.create_dir,
+            remove_dir=mock.sentinel.remove_dir)
+
+        self.assertEqual(expected_dir_name, revert_dir)
+        mock_check_dir.assert_called_once_with(expected_dir_name,
+                                               mock.sentinel.create_dir,
+                                               mock.sentinel.remove_dir)
 
     @ddt.data({},
               {'configured_dir_exists': True},
@@ -132,14 +195,14 @@ class PathUtilsTestCase(test_base.HyperVBaseTestCase):
                'remote_server': mock.sentinel.remote_server})
     @ddt.unpack
     @mock.patch.object(pathutils.PathUtils, '_get_instances_sub_dir')
-    @mock.patch.object(pathutils.PathUtils, '_get_remote_unc_path')
-    @mock.patch.object(pathutils.PathUtils, '_check_dir')
+    @mock.patch.object(pathutils.PathUtils, 'get_remote_path')
+    @mock.patch.object(pathutils.PathUtils, 'check_dir')
     @mock.patch.object(pathutils.os.path, 'exists')
     @mock.patch('os_win.utilsfactory.get_vmutils')
     def test_get_instance_dir(self, mock_get_vmutils,
                               mock_exists,
                               mock_check_dir,
-                              mock_get_remote_unc_path,
+                              mock_get_remote_path,
                               mock_get_instances_sub_dir,
                               configured_dir_exists=False,
                               remote_server=None, vm_exists=False):
@@ -156,7 +219,7 @@ class PathUtilsTestCase(test_base.HyperVBaseTestCase):
             else os_win_exc.HyperVVMNotFoundException(
                 vm_name=mock.sentinel.instance_name))
 
-        mock_get_remote_unc_path.return_value = mock.sentinel.remote_root_dir
+        mock_get_remote_path.return_value = mock.sentinel.remote_root_dir
 
         instance_dir = self._pathutils.get_instance_dir(
             mock.sentinel.instance_name,
@@ -174,7 +237,7 @@ class PathUtilsTestCase(test_base.HyperVBaseTestCase):
 
             if remote_server:
                 expected_instance_dir = mock.sentinel.remote_root_dir
-                mock_get_remote_unc_path.assert_called_once_with(
+                mock_get_remote_path.assert_called_once_with(
                     mock.sentinel.remote_server,
                     mock.sentinel.config_root_dir)
             else:
@@ -196,7 +259,7 @@ class PathUtilsTestCase(test_base.HyperVBaseTestCase):
               {'cached_dir': mock.sentinel.cached_dir})
     @ddt.unpack
     @mock.patch('os.path.exists')
-    @mock.patch.object(pathutils.PathUtils, '_check_dir')
+    @mock.patch.object(pathutils.PathUtils, 'check_dir')
     @mock.patch.object(pathutils.PathUtils, '_get_instances_sub_dir')
     def test_instance_dir_cache(self, mock_get_subdir,
                                 mock_check_dir, mock_exists,
@@ -265,6 +328,47 @@ class PathUtilsTestCase(test_base.HyperVBaseTestCase):
         configdrive_path = self._pathutils.lookup_configdrive_path(
             self.fake_instance_name)
         self.assertIsNone(configdrive_path)
+
+    def test_copy_vm_console_logs(self):
+        fake_local_logs = [mock.sentinel.log_path,
+                           mock.sentinel.archived_log_path]
+        fake_remote_logs = [mock.sentinel.remote_log_path,
+                            mock.sentinel.remote_archived_log_path]
+
+        self._pathutils.exists = mock.Mock(return_value=True)
+        self._pathutils.copy = mock.Mock()
+        self._pathutils.get_vm_console_log_paths = mock.Mock(
+            side_effect=[fake_local_logs, fake_remote_logs])
+
+        self._pathutils.copy_vm_console_logs(mock.sentinel.instance_name,
+                                            mock.sentinel.dest_host)
+
+        self._pathutils.get_vm_console_log_paths.assert_has_calls(
+            [mock.call(mock.sentinel.instance_name),
+             mock.call(mock.sentinel.instance_name,
+                       remote_server=mock.sentinel.dest_host)])
+        self._pathutils.copy.assert_has_calls([
+            mock.call(mock.sentinel.log_path,
+                      mock.sentinel.remote_log_path),
+            mock.call(mock.sentinel.archived_log_path,
+                      mock.sentinel.remote_archived_log_path)])
+
+    @mock.patch.object(pathutils.PathUtils, 'check_dir')
+    @mock.patch.object(pathutils.PathUtils, 'get_instance_dir')
+    def test_export_dir(self, mock_get_instance_dir, mock_check_dir):
+        mock_get_instance_dir.return_value = self.fake_instance_dir
+
+        export_dir = self._pathutils.get_export_dir(
+            mock.sentinel.instance_name, create_dir=mock.sentinel.create_dir,
+            remove_dir=mock.sentinel.remove_dir)
+
+        expected_dir = os.path.join(self.fake_instance_dir, 'export')
+        self.assertEqual(expected_dir, export_dir)
+        mock_get_instance_dir.assert_called_once_with(
+            mock.sentinel.instance_name, create_dir=mock.sentinel.create_dir)
+        mock_check_dir.assert_called_once_with(
+            expected_dir, create_dir=mock.sentinel.create_dir,
+            remove_dir=mock.sentinel.remove_dir)
 
     def test_copy_vm_console_logs(self):
         fake_local_logs = [mock.sentinel.log_path,
@@ -362,3 +466,57 @@ class PathUtilsTestCase(test_base.HyperVBaseTestCase):
             [mock.call(), mock.call(mock.sentinel.dest)])
         mock_check_dirs_shared_storage.assert_called_once_with(
             mock.sentinel.local_inst_dir, mock.sentinel.remote_inst_dir)
+
+    @mock.patch.object(pathutils.PathUtils, 'get_instance_dir')
+    def test_get_instance_snapshot_dir(self, mock_get_instance_dir):
+        mock_get_instance_dir.return_value = self.fake_instance_dir
+        response = self._pathutils.get_instance_snapshot_dir(
+            self.fake_instance_name)
+
+        expected_path = os.path.join(self.fake_instance_dir, 'Snapshots')
+        self.assertEqual(expected_path, response)
+        mock_get_instance_dir.assert_called_once_with(self.fake_instance_name,
+                                                      create_dir=False)
+
+    @mock.patch.object(pathutils.PathUtils, 'get_instance_dir')
+    def test_get_instance_virtual_machines_dir(self, mock_get_instance_dir):
+        mock_get_instance_dir.return_value = self.fake_instance_dir
+        response = self._pathutils.get_instance_virtual_machines_dir(
+            self.fake_instance_name)
+
+        expected_path = os.path.join(self.fake_instance_dir,
+                                     'Virtual Machines')
+        self.assertEqual(expected_path, response)
+        mock_get_instance_dir.assert_called_once_with(self.fake_instance_name,
+                                                      create_dir=False)
+
+    @mock.patch.object(pathutils.PathUtils, 'copy_folder_files')
+    @mock.patch.object(pathutils.PathUtils,
+                       'get_instance_virtual_machines_dir')
+    def test_copy_vm_config_files(self, mock_get_inst_vm_dir, mock_copy_files):
+        self._pathutils.copy_vm_config_files(mock.sentinel.instance_name,
+                                             mock.sentinel.dest_dir)
+
+        mock_get_inst_vm_dir.assert_called_once_with(
+            mock.sentinel.instance_name)
+        mock_copy_files.assert_called_once_with(
+            mock_get_inst_vm_dir.return_value, mock.sentinel.dest_dir)
+
+    @mock.patch('os.listdir')
+    def test_get_vm_config_file(self, mock_listdir):
+        config_file = '81027A62-7187-4EC4-AFF5-9CA853BF7C68.vmcx'
+        mock_listdir.return_value = [config_file]
+
+        response = self._pathutils.get_vm_config_file(self.fake_instance_dir)
+
+        expected_path = os.path.join(self.fake_instance_dir, config_file)
+        self.assertEqual(expected_path, response)
+        mock_listdir.assert_called_once_with(self.fake_instance_dir)
+
+    @mock.patch('os.listdir')
+    def test_get_vm_config_file_exception(self, mock_listdir):
+        mock_listdir.return_value = ['fake_file']
+
+        self.assertRaises(exception.NotFound,
+                          self._pathutils.get_vm_config_file,
+                          mock.sentinel.instances_path)

@@ -23,6 +23,7 @@ from os_win.utils import pathutils
 from os_win import utilsfactory
 from oslo_config import cfg
 from oslo_log import log as logging
+from oslo_utils import uuidutils
 
 from hyperv.i18n import _, _LI
 from hyperv.nova import constants
@@ -53,10 +54,29 @@ ERROR_INVALID_NAME = 123
 
 class PathUtils(pathutils.PathUtils):
 
+    _CSV_FOLDER = 'ClusterStorage\\'
+
     def __init__(self):
         super(PathUtils, self).__init__()
         self._smbutils = utilsfactory.get_smbutils()
         self._vmutils = utilsfactory.get_vmutils()
+
+    def copy_folder_files(self, src_dir, dest_dir):
+        """Copies the files of the given src_dir to dest_dir.
+
+        It will ignore any nested folders.
+
+        :param src_dir: Given folder from which to copy files.
+        :param dest_dir: Folder to which to copy files.
+        """
+
+        # NOTE(claudiub): this will have to be moved to os-win.
+
+        for fname in os.listdir(src_dir):
+            src = os.path.join(src_dir, fname)
+            # ignore subdirs.
+            if os.path.isfile(src):
+                self.copy(src, os.path.join(dest_dir, fname))
 
     def get_instances_dir(self, remote_server=None):
         local_instance_path = os.path.normpath(CONF.instances_path)
@@ -68,29 +88,41 @@ class PathUtils(pathutils.PathUtils):
                 # In this case, we expect the instance dir to have the same
                 # location on the remote server.
                 path = local_instance_path
-            return self._get_remote_unc_path(remote_server, path)
+            return self.get_remote_path(remote_server, path)
         else:
             return local_instance_path
 
-    def _get_remote_unc_path(self, remote_server, remote_path):
+    def get_remote_path(self, remote_server, remote_path):
         if remote_path.startswith('\\\\'):
-            remote_unc_path = remote_path
-        else:
-            # Use an administrative share
-            remote_unc_path = ('\\\\%(remote_server)s\\%(path)s' %
-                               dict(remote_server=remote_server,
-                                    path=remote_path.replace(':', '$')))
+            return remote_path
+
+        # Use an administrative share
+        remote_unc_path = ('\\\\%(remote_server)s\\%(path)s' %
+                           dict(remote_server=remote_server,
+                                path=remote_path.replace(':', '$')))
+
+        csv_location = '\\'.join([os.getenv('SYSTEMDRIVE', 'C:'),
+                                  self._CSV_FOLDER])
+        if remote_path.lower().startswith(csv_location.lower()):
+            # the given remote_path is a CSV path.
+            # Return remote_path as the local path.
+            LOG.debug("Remote path %s is on a CSV. Returning as a local path.",
+                      remote_path)
+            return remote_path
+
+        LOG.debug('Returning UNC path %(unc_path)s for host %(host)s.',
+                  dict(unc_path=remote_unc_path, host=remote_server))
         return remote_unc_path
 
     def _get_instances_sub_dir(self, dir_name, remote_server=None,
                                create_dir=True, remove_dir=False):
         instances_path = self.get_instances_dir(remote_server)
         path = os.path.join(instances_path, dir_name)
-        self._check_dir(path, create_dir=create_dir, remove_dir=remove_dir)
+        self.check_dir(path, create_dir=create_dir, remove_dir=remove_dir)
 
         return path
 
-    def _check_dir(self, path, create_dir=False, remove_dir=False):
+    def check_dir(self, path, create_dir=False, remove_dir=False):
         try:
             if remove_dir:
                 self.check_remove_dir(path)
@@ -106,11 +138,11 @@ class PathUtils(pathutils.PathUtils):
                     "authenticate on a remote host.") % {'path': path})
             raise
 
-    def get_instance_migr_revert_dir(self, instance_name, create_dir=False,
+    def get_instance_migr_revert_dir(self, instance_path, create_dir=False,
                                      remove_dir=False):
-        dir_name = '%s_revert' % instance_name
-        return self._get_instances_sub_dir(dir_name, None, create_dir,
-                                           remove_dir)
+        dir_name = '%s_revert' % instance_path
+        self.check_dir(dir_name, create_dir, remove_dir)
+        return dir_name
 
     def _get_instance_dir(self, instance_name, remote_server=None):
         instance_dir = self._get_instances_sub_dir(
@@ -126,8 +158,8 @@ class PathUtils(pathutils.PathUtils):
                 instance_dir = vmutils.get_vm_config_root_dir(
                     instance_name)
                 if remote_server:
-                    instance_dir = self._get_remote_unc_path(remote_server,
-                                                             instance_dir)
+                    instance_dir = self.get_remote_path(remote_server,
+                                                        instance_dir)
                 LOG.info(_LI("Found instance dir at non-default location: %s"),
                          instance_dir)
             except os_win_exc.HyperVVMNotFoundException:
@@ -135,20 +167,14 @@ class PathUtils(pathutils.PathUtils):
 
         return instance_dir
 
-    def get_instnace_migr_temp_dir(self, instance_name, create_dir=False,
-                                   remove_dir=False):
-        dir_name = '%s_tmp' % instance_name
-        return self._get_instances_sub_dir(dir_name, None, create_dir,
-                                           remove_dir)
-
     def get_instance_dir(self, instance_name, remote_server=None,
                          create_dir=True, remove_dir=False):
         instance_dir = self._get_instance_dir(instance_name,
                                               remote_server)
 
-        self._check_dir(instance_dir,
-                        create_dir=create_dir,
-                        remove_dir=remove_dir)
+        self.check_dir(instance_dir,
+                       create_dir=create_dir,
+                       remove_dir=remove_dir)
 
         return instance_dir
 
@@ -206,10 +232,16 @@ class PathUtils(pathutils.PathUtils):
     def get_base_vhd_dir(self):
         return self._get_instances_sub_dir('_base')
 
-    def get_export_dir(self, instance_name):
-        dir_name = os.path.join('export', instance_name)
-        return self._get_instances_sub_dir(dir_name, create_dir=True,
-                                           remove_dir=True)
+    def get_export_dir(self, instance_name=None, instance_dir=None,
+                       create_dir=False, remove_dir=False):
+        if not instance_dir:
+            instance_dir = self.get_instance_dir(instance_name,
+                                                 create_dir=create_dir)
+
+        export_dir = os.path.join(instance_dir, 'export')
+        self.check_dir(export_dir, create_dir=create_dir,
+                       remove_dir=remove_dir)
+        return export_dir
 
     def get_vm_console_log_paths(self, vm_name, remote_server=None):
         instance_dir = self.get_instance_dir(vm_name,
@@ -245,6 +277,9 @@ class PathUtils(pathutils.PathUtils):
         # Check if shared storage is being used by creating a temporary
         # file at the destination path and checking if it exists at the
         # source path.
+        LOG.debug("Checking if %(src_dir)s and %(dest_dir)s point "
+                  "to the same location.",
+                  dict(src_dir=src_dir, dest_dir=dest_dir))
         with tempfile.NamedTemporaryFile(dir=dest_dir) as tmp_file:
             src_path = os.path.join(src_dir,
                                     os.path.basename(tmp_file.name))
@@ -259,3 +294,39 @@ class PathUtils(pathutils.PathUtils):
         remote_inst_dir = self.get_instances_dir(dest)
         return self.check_dirs_shared_storage(local_inst_dir,
                                               remote_inst_dir)
+
+    def get_instance_snapshot_dir(self, instance_name=None, instance_dir=None):
+        if instance_name:
+            instance_dir = self.get_instance_dir(instance_name,
+                                                 create_dir=False)
+        return os.path.join(instance_dir, 'Snapshots')
+
+    def get_instance_virtual_machines_dir(self, instance_name=None,
+                                          instance_dir=None):
+        if instance_name:
+            instance_dir = self.get_instance_dir(instance_name,
+                                                 create_dir=False)
+        return os.path.join(instance_dir, "Virtual Machines")
+
+    def copy_vm_config_files(self, instance_name, dest_dir):
+        """Copies the VM configuration files to the given destination folder.
+
+        :param instance_name: the given instance's name.
+        :param dest_dir: the location where the VM configuration files are
+            copied to.
+        """
+        src_dir = self.get_instance_virtual_machines_dir(instance_name)
+        self.copy_folder_files(src_dir, dest_dir)
+
+    def get_vm_config_file(self, path):
+        for dir_file in os.listdir(path):
+            file_name, file_ext = os.path.splitext(dir_file)
+            if (file_ext.lower() in ['.vmcx', '.xml'] and
+                    uuidutils.is_uuid_like(file_name)):
+
+                config_file = os.path.join(path, dir_file)
+                LOG.debug("Found VM config file: %s", config_file)
+                return config_file
+
+        raise exception.NotFound(
+            _("Folder %s does not contain any VM config data file.") % path)
